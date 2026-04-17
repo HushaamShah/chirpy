@@ -1,23 +1,51 @@
 package main
 
 import (
+	"chirpy/internal/database"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	queries        *database.Queries
+	platform       string
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
 }
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	dbURL := os.Getenv("DB_URL")
+	platform := os.Getenv("PLATFORM")
+
+	db, err := sql.Open("postgres", dbURL)
+	dbQueries := database.New(db)
 	port := "8080"
 	mux := http.NewServeMux()
 	cfg := apiConfig{
 		fileserverHits: atomic.Int32{},
+		queries:        dbQueries,
+		platform:       platform,
 	}
 	server := http.Server{
 		Addr:    ":" + port,
@@ -29,6 +57,7 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", cfg.getMetrics)
 	mux.HandleFunc("POST /admin/reset", cfg.resetMetrics)
 	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
+	mux.HandleFunc("POST /api/users", cfg.addUser)
 	log.Printf("Serving on port: %s\n", port)
 	server.ListenAndServe()
 
@@ -61,7 +90,7 @@ func validateChirp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type resSuccVal struct {
-		Cleaned_body string `json:"string"`
+		Cleaned_body string `json:"cleaned_body"`
 	}
 
 	res := resSuccVal{
@@ -69,7 +98,7 @@ func validateChirp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res.Cleaned_body = replaceProfanity(res.Cleaned_body)
-	// println(res)
+
 	respondWithJSON(w, 200, res)
 
 }
@@ -94,9 +123,6 @@ func respondWithError(w http.ResponseWriter, code int, msg string) {
 }
 
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	// resError := resErrorVal{}
-	// log.Printf("Error decoding parameters: %s", msg)
-	// resError.error = msg
 	dat, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("Error marshalling JSON: %s", err)
@@ -109,12 +135,49 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 }
 
 func replaceProfanity(msg string) string {
+	test := msg
 	profanity := [3]string{"kerfuffle", "sharbert", "fornax"}
-	for _, prof := range profanity {
-		msg = strings.ReplaceAll(strings.ToLower(msg), strings.ToLower(prof), "****")
+	msgArray := strings.Split(msg, " ")
+	for i, word := range msgArray {
+		for _, prof := range profanity {
+			if strings.EqualFold(word, prof) {
+				msgArray[i] = strings.ReplaceAll(strings.ToLower(word), strings.ToLower(prof), "****")
+			}
+		}
+	}
+	msg = strings.Join(msgArray, " ")
+	if msg == test {
+		fmt.Println("same")
 	}
 	return msg
 	// strings.Replace(msg, )
+}
+
+func (cfg *apiConfig) addUser(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Email string `text:"email"`
+	}
+
+	params := parameters{}
+
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, 500, err.Error())
+		fmt.Println(err)
+	}
+
+	user, err := cfg.queries.CreateUser(r.Context(), params.Email)
+	respUser := User{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	}
+	respondWithJSON(w, 201, respUser)
+	// return &user, nil
+	// fmt.Println(params.Email)
+
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -133,7 +196,16 @@ func (cfg *apiConfig) getMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) resetMetrics(w http.ResponseWriter, r *http.Request) {
+	if strings.ToLower(cfg.platform) != "dev" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+	}
 	cfg.fileserverHits.Store(0)
+	err := cfg.queries.DeleteAllUsers(r.Context())
+	if err != nil {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 }
